@@ -1,0 +1,5 @@
+tqdm
+odfpy
+pandas
+requests
+python-dotenv
