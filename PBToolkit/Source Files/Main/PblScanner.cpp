@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <algorithm>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -57,6 +58,68 @@ bool PblScanner::syncMirror(const fs::path& source, const fs::path& target) cons
     {
         Logger::Error(L"[Mirror] Remote source not found: " + source.wstring());
         return false;
+    }
+
+    try
+    {
+        if (fs::exists(target) && !fs::is_directory(target))
+            fs::remove(target);
+
+        if (!fs::exists(target))
+            fs::create_directories(target);
+    }
+    catch (...)
+    {
+        Logger::Error(L"[Mirror] Could not initialize mirror target: " + target.wstring());
+        return false;
+    }
+
+    // 0. Remove stale entries and resolve file/folder type conflicts.
+    try
+    {
+        fs::directory_options opts = fs::directory_options::skip_permission_denied;
+        std::vector<fs::path> targetEntries;
+
+        for (auto it = fs::recursive_directory_iterator(target, opts);
+            it != fs::recursive_directory_iterator(); ++it)
+        {
+            targetEntries.push_back(it->path());
+        }
+
+        std::sort(targetEntries.begin(), targetEntries.end(),
+            [](const fs::path& a, const fs::path& b)
+            {
+                return a.native().size() > b.native().size();
+            });
+
+        for (const auto& dstPath : targetEntries)
+        {
+            fs::path rel = dstPath.lexically_relative(target);
+            fs::path srcPath = source / rel;
+
+            bool mustDelete = false;
+            if (!fs::exists(srcPath))
+                mustDelete = true;
+            else
+            {
+                bool srcIsDir = fs::is_directory(srcPath);
+                bool dstIsDir = fs::is_directory(dstPath);
+                if (srcIsDir != dstIsDir)
+                    mustDelete = true;
+            }
+
+            if (!mustDelete)
+                continue;
+
+            if (fs::is_directory(dstPath))
+                fs::remove_all(dstPath);
+            else
+                fs::remove(dstPath);
+        }
+    }
+    catch (...)
+    {
+        Logger::Warn(L"[Mirror] Cleanup of stale entries skipped for: " + target.wstring());
     }
 
     // 1. Collect all files

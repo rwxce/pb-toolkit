@@ -3,6 +3,7 @@
 #include "MirrorManager.h"
 
 #include <chrono>
+#include <algorithm>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -77,6 +78,51 @@ bool MirrorManager::syncFolder(const fs::path& src,
 
     try
     {
+        if (fs::exists(dst) && !fs::is_directory(dst))
+            fs::remove(dst);
+
+        if (!fs::exists(dst))
+            fs::create_directories(dst);
+
+        // Remove stale entries that no longer exist in source.
+        std::vector<fs::path> dstEntries;
+        for (auto it = fs::recursive_directory_iterator(dst, opts);
+            it != fs::recursive_directory_iterator(); ++it)
+        {
+            dstEntries.push_back(it->path());
+        }
+
+        std::sort(dstEntries.begin(), dstEntries.end(),
+            [](const fs::path& a, const fs::path& b)
+            {
+                return a.native().size() > b.native().size();
+            });
+
+        for (const auto& pDst : dstEntries)
+        {
+            fs::path rel = pDst.lexically_relative(dst);
+            fs::path pSrc = src / rel;
+
+            bool mustDelete = false;
+            if (!fs::exists(pSrc))
+                mustDelete = true;
+            else
+            {
+                bool srcIsDir = fs::is_directory(pSrc);
+                bool dstIsDir = fs::is_directory(pDst);
+                if (srcIsDir != dstIsDir)
+                    mustDelete = true;
+            }
+
+            if (!mustDelete)
+                continue;
+
+            if (fs::is_directory(pDst))
+                fs::remove_all(pDst);
+            else
+                fs::remove(pDst);
+        }
+
         for (auto it = fs::recursive_directory_iterator(src, opts);
             it != fs::recursive_directory_iterator(); ++it)
         {
