@@ -38,6 +38,7 @@ const fs::path Config::SOURCES_DIR = Config::EXTRACT_ROOT / "Sources";
 const fs::path Config::CONVERTED_DIR = Config::EXTRACT_ROOT / "Converted";
 const fs::path Config::SELECTS_DIR = Config::EXTRACT_ROOT / "Selects";
 const fs::path Config::PROJECTS_DIR = Config::EXTRACT_ROOT / "Projects";
+const fs::path Config::AICODEBASE_DIR = Config::EXTRACT_ROOT / "AICodebase";
 
 // Python environment
 const fs::path Config::PY_SCRIPTS_DIR = Config::SOURCE_DIR / "Python";

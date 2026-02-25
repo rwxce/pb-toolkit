@@ -23,6 +23,7 @@ public:
     static const std::filesystem::path CONVERTED_DIR; /// Directory for converted PowerBuilder sources
     static const std::filesystem::path SELECTS_DIR; /// Directory containing exported SQL SELECT statements
     static const std::filesystem::path PROJECTS_DIR; /// Directory containing generated project dependency files (PBT → PBL mappings)
+    static const std::filesystem::path AICODEBASE_DIR; /// Directory containing AI-optimized codebase mirrors
 
     // Python environment
     static const std::filesystem::path PY_SCRIPTS_DIR; /// Directory containing Python scripts

@@ -89,6 +89,9 @@
     <None Include="Source Files\Python\summarize_selects.py">
       <Filter>Source Files\Python</Filter>
     </None>
+    <None Include="Source Files\Python\extract_aicodebase.py">
+      <Filter>Source Files\Python</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Resource Files\Libraries\pbldump-1.3.1stable\ReadMe.en.txt">

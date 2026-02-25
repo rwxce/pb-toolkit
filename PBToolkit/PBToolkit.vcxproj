@@ -150,6 +150,7 @@
     <None Include="Resource Files\Libraries\pbldump-1.3.1stable\PblDump.exe" />
     <None Include="Resource Files\Libraries\pbldump-1.3.1stable\test_app.pbl" />
     <None Include="Source Files\Python\combine_to_files.py" />
+    <None Include="Source Files\Python\extract_aicodebase.py" />
     <None Include="Source Files\Python\extract_pbt_dependencies.py" />
     <None Include="Source Files\Python\extract_selects.py" />
     <None Include="Source Files\Python\extract_table_values.py" />

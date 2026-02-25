@@ -156,6 +156,7 @@ bool PythonRunner::runScript(const std::wstring& scriptName,
     ensureDirectory(Config::CONVERTED_DIR);
     ensureDirectory(Config::SOURCES_DIR);
     ensureDirectory(Config::SELECTS_DIR);
+    ensureDirectory(Config::AICODEBASE_DIR);
 
     Logger::Info(L"[PY] Executing script: " + scriptName);
 
@@ -219,6 +220,14 @@ static std::vector<PyScriptDef> getPythonScripts()
             {
                 Config::MIRROR_ROOT.wstring(),
                 Config::PROJECTS_DIR.wstring()
+            }
+        },
+        {
+            L"extract_aicodebase.py",
+            {
+                Config::MIRROR_ROOT.wstring(),
+                Config::SOURCES_DIR.wstring(),
+                Config::AICODEBASE_DIR.wstring()
             }
         },
         {
