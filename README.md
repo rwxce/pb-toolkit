@@ -1,6 +1,6 @@
 # PBToolkit
 
-**PBToolkit** is a PowerBuilder analysis and extraction toolkit designed to perform **large-scale, automated extraction of PowerBuilder libraries (PBLs)** and generate structured, reusable artifacts for analysis and documentation.
+**PBToolkit** is a PowerBuilder analysis and extraction toolkit designed to perform **large-scale, automated extraction of PowerBuilder libraries (PBLs)** and generate structured, reusable artifacts for analysis and documentation, with the ability to leverage AI tools for enhanced code analysis and development insights.
 
 The project is built around the open-source tool
 [pb-pbldump](https://github.com/amoskovsky/pb-pbldump) by *amoskovsky*, which is used as the core extraction engine.
@@ -28,12 +28,16 @@ PBToolkit exists because native PowerBuilder tools such as **ORCA / ORCAScript**
   * SQL SELECT usage analysis
   * Data table mappings
   * Project dependency metadata
+  * AICodebase folder (PowerBuilder + AI)
 
 * **Extensible Python post-processing**
   Includes a Python pipeline that can be easily extended with additional scripts.
 
 * **CLI-based interactive menu**
   Provides a console menu to run the full pipeline or individual steps.
+
+* **Creation of the AICodebase folder**
+  Creates an `AICodebase` folder for analyzing large-scale projects with tools like OpenCode, ZeroClaw, VSCode, and AI models.
 
 ---
 
