@@ -88,7 +88,7 @@ You may freely add or remove versions as needed.
 > * `MirrorManager.cpp`
 > * `MenuHandler.cpp`
 > * `PblScanner.cpp`
-> * All Python sripts
+> * All Python scripts
 
 ---
 
