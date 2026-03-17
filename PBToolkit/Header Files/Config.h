@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include <string>
+#include <vector>
 #include <filesystem>
 
 /**
@@ -40,4 +41,9 @@ public:
     static const inline std::wstring V9 = L"9.0";
     static const inline std::wstring V105 = L"10.5";
     static const inline std::wstring V125 = L"12.5";
+
+    // Ordered list used by menus/scripts that need to iterate supported versions.
+    static const inline std::vector<std::wstring> SUPPORTED_VERSIONS = {
+        V65, V7, V8, V9, V105, V125
+    };
 };

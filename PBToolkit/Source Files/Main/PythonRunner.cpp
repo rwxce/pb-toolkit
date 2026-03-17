@@ -14,8 +14,10 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cwctype>
 #include <cstdlib>
 #include <iostream>
+#include <algorithm>
 #include <Windows.h>
 #include <process.h>
 #include <functional>
@@ -210,6 +212,239 @@ struct PyScriptDef {
 };
 
 /**
+ * Returns a lowercase copy of the given text.
+ */
+static std::wstring toLower(const std::wstring& value)
+{
+    std::wstring out = value;
+    std::transform(out.begin(), out.end(), out.begin(), [](wchar_t c) {
+        return static_cast<wchar_t>(std::towlower(c));
+        });
+    return out;
+}
+
+/**
+ * Applies the same sanitization strategy used by Python output naming.
+ */
+static std::wstring sanitizePbName(const std::wstring& input)
+{
+    std::wstring out;
+    out.reserve(input.size());
+    bool lastUnderscore = false;
+
+    for (wchar_t c : input)
+    {
+        const bool forbidden = (c == L'<' || c == L'>' || c == L':' || c == L'"' ||
+            c == L'/' || c == L'\\' || c == L'|' || c == L'?' || c == L'*');
+        const bool space = std::iswspace(c) != 0;
+
+        wchar_t next = c;
+        if (forbidden || space)
+            next = L'_';
+
+        if (next == L'_')
+        {
+            if (lastUnderscore)
+                continue;
+            lastUnderscore = true;
+        }
+        else
+        {
+            lastUnderscore = false;
+        }
+
+        out.push_back(next);
+    }
+
+    while (!out.empty() && out.front() == L'_')
+        out.erase(out.begin());
+    while (!out.empty() && out.back() == L'_')
+        out.pop_back();
+
+    return out;
+}
+
+/**
+ * Generic numbered menu selector with Back option.
+ * @param title Menu title text
+ * @param options Available choices
+ * @param outIndex Selected 0-based index when true is returned
+ * @return true if a valid option was selected; false when Back is chosen
+ */
+static bool selectNumberedOption(
+    const std::wstring& title,
+    const std::vector<std::wstring>& options,
+    std::size_t& outIndex)
+{
+    if (options.empty())
+        return false;
+
+    while (true)
+    {
+        printPythonHeader();
+        std::wcout << title << L"\n\n";
+
+        for (std::size_t i = 0; i < options.size(); ++i)
+            std::wcout << L" " << (i + 1) << L" - " << options[i] << L"\n";
+
+        std::wcout << L" 0 - Back\n\n> Select option: ";
+
+        int raw = -1;
+        std::wcin >> raw;
+        std::wcin.ignore(std::numeric_limits<std::streamsize>::max(), L'\n');
+
+        if (raw == 0)
+            return false;
+
+        if (raw < 1 || static_cast<std::size_t>(raw) > options.size())
+        {
+            Logger::Warn(L"Invalid option.");
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            continue;
+        }
+
+        outIndex = static_cast<std::size_t>(raw - 1);
+        return true;
+    }
+}
+
+/**
+ * Discovers PBW projects for a version and returns sanitized names.
+ */
+static std::vector<std::wstring> discoverAicodebaseProjects(const std::wstring& version)
+{
+    std::vector<std::wstring> projects;
+
+    const fs::path versionDir = Config::MIRROR_ROOT / version;
+    if (!fs::exists(versionDir))
+        return projects;
+
+    std::error_code ec;
+    fs::recursive_directory_iterator it(versionDir, ec);
+    fs::recursive_directory_iterator end;
+
+    while (!ec && it != end)
+    {
+        const auto& entry = *it;
+        if (entry.is_regular_file(ec))
+        {
+            const std::wstring ext = toLower(entry.path().extension().wstring());
+            if (ext == L".pbw")
+            {
+                const std::wstring candidate = sanitizePbName(entry.path().stem().wstring());
+                if (!candidate.empty())
+                {
+                    const auto found = std::find(projects.begin(), projects.end(), candidate);
+                    if (found == projects.end())
+                        projects.push_back(candidate);
+                }
+            }
+        }
+        it.increment(ec);
+    }
+
+    std::sort(projects.begin(), projects.end(), [](const std::wstring& a, const std::wstring& b) {
+        return toLower(a) < toLower(b);
+        });
+
+    return projects;
+}
+
+/**
+ * Builds extract_aicodebase.py args from submenu choices.
+ * @param script Script definition containing base arguments
+ * @param outArgs Final argument vector to execute
+ * @param userCancelled True when user selected Back
+ * @return true when arguments are fully prepared
+ */
+static bool tryBuildAicodebaseArgs(
+    const PyScriptDef& script,
+    std::vector<std::wstring>& outArgs,
+    bool& userCancelled)
+{
+    userCancelled = false;
+
+    if (script.args.size() < 3)
+    {
+        Logger::Error(L"extract_aicodebase.py requires 3 base arguments.");
+        return false;
+    }
+
+    std::vector<std::wstring> baseArgs = {
+        script.args[0], script.args[1], script.args[2]
+    };
+
+    while (true)
+    {
+        printPythonHeader();
+        std::wcout << L"============ AICODEBASE MENU ============\n\n";
+        std::wcout << L"1 - Regenerate all\n";
+        std::wcout << L"2 - Regenerate one version\n";
+        std::wcout << L"3 - Regenerate one project in a version\n";
+        std::wcout << L"0 - Back\n\n";
+        std::wcout << L"> Select option: ";
+
+        int opt = -1;
+        std::wcin >> opt;
+        std::wcin.ignore(std::numeric_limits<std::streamsize>::max(), L'\n');
+
+        if (opt == 0)
+        {
+            userCancelled = true;
+            return false;
+        }
+
+        if (opt == 1)
+        {
+            outArgs = baseArgs;
+            outArgs.push_back(L"all");
+            return true;
+        }
+
+        if (opt == 2)
+        {
+            std::size_t idx = 0;
+            if (!selectNumberedOption(L"Select version:", Config::SUPPORTED_VERSIONS, idx))
+                continue;
+
+            outArgs = baseArgs;
+            outArgs.push_back(L"version");
+            outArgs.push_back(Config::SUPPORTED_VERSIONS[idx]);
+            return true;
+        }
+
+        if (opt == 3)
+        {
+            std::size_t versionIdx = 0;
+            if (!selectNumberedOption(L"Select version:", Config::SUPPORTED_VERSIONS, versionIdx))
+                continue;
+
+            const std::wstring version = Config::SUPPORTED_VERSIONS[versionIdx];
+            const auto projects = discoverAicodebaseProjects(version);
+            if (projects.empty())
+            {
+                Logger::Warn(L"No PBW projects found for selected version.");
+                std::this_thread::sleep_for(std::chrono::milliseconds(900));
+                continue;
+            }
+
+            std::size_t projectIdx = 0;
+            if (!selectNumberedOption(L"Select project:", projects, projectIdx))
+                continue;
+
+            outArgs = baseArgs;
+            outArgs.push_back(L"project");
+            outArgs.push_back(version);
+            outArgs.push_back(projects[projectIdx]);
+            return true;
+        }
+
+        Logger::Warn(L"Invalid option.");
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    }
+}
+
+/**
  * Runtime generator of Python script list (fixes static init order issues).
  */
 static std::vector<PyScriptDef> getPythonScripts()
@@ -263,6 +498,7 @@ static std::vector<PyScriptDef> getPythonScripts()
 
 /**
  * Executes the complete Python pipeline.
+ * For extract_aicodebase.py, forces explicit "all" mode.
  */
 bool PythonRunner::runFullPipeline()
 {
@@ -272,7 +508,22 @@ bool PythonRunner::runFullPipeline()
 
     for (const auto& script : getPythonScripts())
     {
-        if (!runScript(script.name, script.args))
+        std::vector<std::wstring> argsToRun = script.args;
+        if (script.name == L"extract_aicodebase.py")
+        {
+            if (argsToRun.size() >= 3)
+            {
+                argsToRun = { argsToRun[0], argsToRun[1], argsToRun[2], L"all" };
+            }
+            else
+            {
+                Logger::Error(L"extract_aicodebase.py requires 3 base arguments.");
+                success = false;
+                break;
+            }
+        }
+
+        if (!runScript(script.name, argsToRun))
         {
             success = false;
             break;
@@ -342,11 +593,26 @@ bool PythonRunner::runSingleScript()
         }
 
         const auto& script = scripts[choiceIdx - 1];
+                std::vector<std::wstring> argsToRun = script.args;
+
+        if (script.name == L"extract_aicodebase.py")
+        {
+            bool userCancelled = false;
+            if (!tryBuildAicodebaseArgs(script, argsToRun, userCancelled))
+            {
+                if (userCancelled)
+                    continue;
+
+                std::wcout << L"\nScript could not be configured. Press Enter to continue...";
+                std::wcin.get();
+                return false;
+            }
+        }
 
         printPythonHeader();
         Logger::Info(L"Running script: " + script.name);
 
-        bool ok = runScript(script.name, script.args);
+        bool ok = runScript(script.name, argsToRun);
 
         std::wcout << L"\nScript finished. Press Enter to continue...";
         std::wcin.get();

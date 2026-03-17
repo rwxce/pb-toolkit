@@ -2,9 +2,11 @@ import os
 import re
 import sys
 import json
+import time
 import shutil
 import ctypes
 import hashlib
+import tempfile
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -17,6 +19,9 @@ WARNINGS_ENABLED = False
 
 # File extensions belonging to exported PowerBuilder source objects.
 EXTS = ["*.sr*", "*.srd", "*.srs"]
+
+# Manifest schema for content-aware PBL fingerprints.
+FINGERPRINT_SCHEMA = 2
 
 # PBW parsing
 PBW_TARGETS_BLOCK_RE = re.compile(r"@begin\s+Targets(.*?)@end;", re.IGNORECASE | re.DOTALL)
@@ -294,35 +299,71 @@ def sha256_bytes(data: bytes) -> str:
     return h.hexdigest()
 
 
-def compute_pbl_fingerprint(pbl_sources_dir: Path) -> Dict[str, object]:
+def sha256_file(path: Path) -> str:
+    """
+    Computes sha256 for a file using chunked reads to limit memory usage.
+    """
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def compute_pbl_fingerprint(
+    pbl_sources_dir: Path,
+    previous_entry: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     """
     Computes a deterministic fingerprint of the PBL subtree under Sources/<version>/<pbl>.
-    Uses (relative_path, size, mtime_ns). Also produces an aggregate sha256 of the list.
+    v2 content-aware fingerprint:
+      - metadata: relative_path, size, mtime_ns
+      - content hash: sha256 per file
+    Computes content hash for each file to guarantee detection even when timestamps are preserved.
     """
     files = collect_object_files(pbl_sources_dir)
 
-    entries: List[Tuple[str, int, int]] = []
+    entries: List[Tuple[str, int, int, str]] = []
+    files_map: Dict[str, Dict[str, object]] = {}
     for f in files:
         st = f.stat()
         rel = f.relative_to(pbl_sources_dir).as_posix()
-        entries.append((rel, int(st.st_size), int(st.st_mtime_ns)))
+        size = int(st.st_size)
+        mtime_ns = int(st.st_mtime_ns)
+        file_sha = sha256_file(f)
+
+        files_map[rel] = {
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "sha256": file_sha,
+        }
+        entries.append((rel, size, mtime_ns, file_sha))
 
     # Deterministic serialization
-    blob = "\n".join(f"{rel}|{size}|{mtime}" for (rel, size, mtime) in entries).encode("utf-8", errors="ignore")
+    blob = "\n".join(
+        f"{rel}|{size}|{mtime}|{file_sha}" for (rel, size, mtime, file_sha) in entries
+    ).encode("utf-8", errors="ignore")
     fp = sha256_bytes(blob)
 
     total_size = sum(e[1] for e in entries)
     mtime_max = max((e[2] for e in entries), default=0)
 
     return {
+        "fingerprint_schema": FINGERPRINT_SCHEMA,
         "fingerprint": fp,
         "total_size": total_size,
         "mtime_max": mtime_max,
         "file_count": len(entries),
+        "files": files_map,
     }
 
 
 def load_json(path: Path) -> Dict[str, object]:
+    """
+    Loads a JSON file as a dict, returning {} on missing/invalid content.
+    """
     if not path.exists():
         return {}
     try:
@@ -331,9 +372,75 @@ def load_json(path: Path) -> Dict[str, object]:
         return {}
 
 
+def read_text_if_exists(path: Path) -> Optional[str]:
+    """
+    Best-effort text read for an existing file, otherwise None.
+    """
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def set_file_attributes_normal_windows(path: Path) -> None:
+    """
+    Clears restrictive attributes on Windows before writing (best effort).
+    """
+    if os.name != "nt":
+        return
+    try:
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_NORMAL)
+    except Exception:
+        pass
+
+
 def save_json(path: Path, data: Dict[str, object]) -> None:
+    """
+    Safely persists JSON to disk on Windows:
+      - skip if unchanged
+      - repair invalid path state (directory where file is expected)
+      - atomic replace via temporary file
+      - retry on transient PermissionError
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8", errors="ignore")
+
+    payload = json.dumps(data, indent=2, ensure_ascii=False)
+    existing = read_text_if_exists(path)
+    if existing == payload:
+        return
+
+    # Defensive cleanup for corrupt state: manifest path must be a file.
+    if path.exists() and path.is_dir():
+        ensure_removed(path)
+
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        tmp_path = None
+        try:
+            if path.exists():
+                set_file_attributes_normal_windows(path)
+
+            fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.tmp.", dir=str(path.parent))
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="ignore") as handle:
+                handle.write(payload)
+
+            set_file_attributes_normal_windows(tmp_path)
+            os.replace(str(tmp_path), str(path))
+            return
+        except PermissionError as ex:
+            if tmp_path is not None:
+                ensure_removed(tmp_path)
+            if attempt >= max_attempts - 1:
+                raise PermissionError(f"{path} ({ex})")
+            time.sleep(0.12 * (attempt + 1))
+        except Exception:
+            if tmp_path is not None:
+                ensure_removed(tmp_path)
+            raise
 
 
 def set_hidden_windows(path: Path) -> None:
@@ -530,10 +637,166 @@ def cleanup_not_in_mirror(
                 ensure_removed(child)
 
 
+def parse_scope_args(argv: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Supported signatures:
+      1) extract_aicodebase.py <mirror_root> <sources_root> <output_root>
+      2) extract_aicodebase.py <mirror_root> <sources_root> <output_root> all
+      3) extract_aicodebase.py <mirror_root> <sources_root> <output_root> version <v>
+      4) extract_aicodebase.py <mirror_root> <sources_root> <output_root> project <v> <pbw>
+    """
+    if len(argv) == 4:
+        return ("all", None, None, None)
+
+    if len(argv) == 5 and argv[4].lower() == "all":
+        return ("all", None, None, None)
+
+    if len(argv) == 6 and argv[4].lower() == "version":
+        return ("version", argv[5], None, None)
+
+    if len(argv) == 7 and argv[4].lower() == "project":
+        return ("project", argv[5], argv[6], None)
+
+    usage = (
+        "Usage:\n"
+        "  extract_aicodebase.py <mirror_root> <sources_root> <output_root>\n"
+        "  extract_aicodebase.py <mirror_root> <sources_root> <output_root> all\n"
+        "  extract_aicodebase.py <mirror_root> <sources_root> <output_root> version <v>\n"
+        "  extract_aicodebase.py <mirror_root> <sources_root> <output_root> project <v> <pbw>"
+    )
+    return (None, None, None, usage)
+
+
+def process_version(
+    version: str,
+    mirror_root: Path,
+    sources_root: Path,
+    output_root: Path,
+    warnings: List[str],
+    project_filter: Optional[str] = None,
+) -> int:
+    """
+    Processes one version end-to-end:
+      - discovers PBWs/PBLs
+      - updates cache per PBL incrementally
+      - assembles PBW output from cache
+      - persists manifest safely
+    Returns non-zero on hard errors (for example manifest save failure).
+    """
+    version_mirror = mirror_root / version
+    version_sources = sources_root / version
+    version_out = output_root / version
+
+    if not version_mirror.exists():
+        warnings.append(f"[AICodebase][WARN] Missing Mirror for version {version}: {version_mirror}")
+        return 0
+
+    if not version_sources.exists():
+        warnings.append(f"[AICodebase][WARN] Missing Sources for version {version}: {version_sources}")
+        return 0
+
+    cache_dir = version_out / ".pblcache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = cache_dir / "_manifest.json"
+    manifest = load_json(manifest_path)
+    if "pbls" not in manifest:
+        manifest["pbls"] = {}
+    if "pbws" not in manifest:
+        manifest["pbws"] = {}
+
+    pbw_map_all = discover_pbw_to_pbls(version_mirror, warnings)
+    pbw_map = pbw_map_all
+
+    if project_filter is not None:
+        project_key = sanitize(project_filter)
+        if project_key not in pbw_map_all:
+            print(f"[AICodebase][ERROR] Project '{project_filter}' not found in version '{version}'.")
+            return 1
+        pbw_map = {project_key: pbw_map_all[project_key]}
+
+    version_out.mkdir(parents=True, exist_ok=True)
+
+    if project_filter is None:
+        cleanup_not_in_mirror(version_out, cache_dir, pbw_map)
+    else:
+        # Targeted cleanup for selected PBW only.
+        for pbw_name, pbls in pbw_map.items():
+            pbw_dir = version_out / pbw_name
+            if not pbw_dir.exists():
+                continue
+            allowed_pbl_dirs = set(sanitize(Path(p).stem) for p in pbls)
+            for child in sorted(pbw_dir.iterdir(), key=lambda p: p.name.lower()):
+                if child.is_dir() and child.name not in allowed_pbl_dirs:
+                    ensure_removed(child)
+
+    required_pbls: List[str] = []
+    seen_req: set[str] = set()
+    for pbw_name in sorted(pbw_map.keys(), key=lambda s: s.lower()):
+        for pbl in pbw_map[pbw_name]:
+            pbl_stem = sanitize(Path(pbl).stem)
+            if pbl_stem not in seen_req:
+                seen_req.add(pbl_stem)
+                required_pbls.append(pbl_stem)
+
+    for pbl_stem in sorted(required_pbls, key=lambda s: s.lower()):
+        pbl_sources_dir = version_sources / pbl_stem
+        if not pbl_sources_dir.exists():
+            warnings.append(f"[AICodebase][WARN] {version}: PBL not found in Sources: {pbl_stem}")
+            continue
+
+        old = manifest["pbls"].get(pbl_stem, {})
+        old_schema = old.get("fingerprint_schema")
+        fp = compute_pbl_fingerprint(pbl_sources_dir, old if isinstance(old, dict) else None)
+        old_fp = old.get("fingerprint") if isinstance(old, dict) else None
+
+        cache_pbl_dir = cache_dir / pbl_stem
+        # Force one rebuild when migrating from old schema to guarantee correctness.
+        schema_migrating = old_schema != FINGERPRINT_SCHEMA
+
+        if not schema_migrating and old_fp == fp["fingerprint"] and cache_pbl_dir.exists():
+            # Keep manifest in sync with reused per-file hashes (cheap no-op if unchanged).
+            manifest["pbls"][pbl_stem] = fp
+            continue
+
+        build_cache_for_pbl(version, pbl_stem, pbl_sources_dir, cache_pbl_dir)
+        manifest["pbls"][pbl_stem] = fp
+
+    for pbw_name in sorted(pbw_map.keys(), key=lambda s: s.lower()):
+        out_pbw_dir = version_out / pbw_name
+        out_pbw_dir.mkdir(parents=True, exist_ok=True)
+        manifest["pbws"][pbw_name] = [sanitize(Path(p).stem) for p in pbw_map[pbw_name]]
+
+        for pbl in pbw_map[pbw_name]:
+            pbl_stem = sanitize(Path(pbl).stem)
+            cache_pbl_dir = cache_dir / pbl_stem
+            if not cache_pbl_dir.exists():
+                continue
+
+            dest = out_pbw_dir / pbl_stem
+            if dest.exists() and not dest.is_symlink():
+                ensure_removed(dest)
+
+            created = try_create_junction(dest, cache_pbl_dir)
+            if not created:
+                copy_tree_incremental(cache_pbl_dir, dest)
+
+    try:
+        save_json(manifest_path, manifest)
+    except PermissionError:
+        print(f"[AICodebase][ERROR] Failed saving manifest for version {version}: {manifest_path}")
+        return 1
+    set_hidden_windows(manifest_path)
+    return 0
+
+
 def main(argv: List[str]) -> int:
     """
     Usage:
       extract_aicodebase.py <mirror_root> <sources_root> <output_root>
+      extract_aicodebase.py <mirror_root> <sources_root> <output_root> all
+      extract_aicodebase.py <mirror_root> <sources_root> <output_root> version <v>
+      extract_aicodebase.py <mirror_root> <sources_root> <output_root> project <v> <pbw>
 
     Always incremental:
       - Builds a shared cache per PBL:  Extraction/AICodebase/<version>/.pblcache/<PBL>/...
@@ -541,7 +804,7 @@ def main(argv: List[str]) -> int:
             Extraction/AICodebase/<version>/<PBW>/<PBL> -> junction to .pblcache/<PBL>
       - Removes outputs not present in the current mirror model.
     """
-    if len(argv) != 4:
+    if len(argv) < 4:
         print("Usage: extract_aicodebase.py <mirror_root> <sources_root> <output_root>")
         return 2
 
@@ -549,104 +812,31 @@ def main(argv: List[str]) -> int:
     sources_root = Path(argv[2])
     output_root = Path(argv[3])
 
+    mode, target_version, target_project, parse_err = parse_scope_args(argv)
+    if parse_err is not None or mode is None:
+        print(parse_err or "[AICodebase][ERROR] Invalid arguments.")
+        return 2
+
+    if target_version is not None and target_version not in VERSIONS:
+        print(f"[AICodebase][ERROR] Unsupported version: {target_version}")
+        print(f"[AICodebase][ERROR] Supported versions: {', '.join(VERSIONS)}")
+        return 2
+
     warnings: List[str] = []
+    versions_to_process = [target_version] if target_version is not None else list(VERSIONS)
+    project_filter = target_project if mode == "project" else None
 
-    for version in VERSIONS:
-        version_mirror = mirror_root / version
-        version_sources = sources_root / version
-        version_out = output_root / version
-
-        if not version_mirror.exists():
-            continue
-        if not version_sources.exists():
-            warnings.append(f"[AICodebase][WARN] Missing Sources for version {version}: {version_sources}")
-            continue
-
-        # Cache folder + manifest
-        cache_dir = version_out / ".pblcache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        manifest_path = cache_dir / "_manifest.json"
-        manifest = load_json(manifest_path)
-        if "pbls" not in manifest:
-            manifest["pbls"] = {}
-        if "pbws" not in manifest:
-            manifest["pbws"] = {}
-
-        # Discover mirror model
-        pbw_map = discover_pbw_to_pbls(version_mirror, warnings)
-
-        # Cleanup outputs not in mirror
-        version_out.mkdir(parents=True, exist_ok=True)
-        cleanup_not_in_mirror(version_out, cache_dir, pbw_map)
-
-        # Compute required PBLs across all PBWs
-        required_pbls: List[str] = []
-        seen_req: set[str] = set()
-        for pbw_name in sorted(pbw_map.keys(), key=lambda s: s.lower()):
-            for pbl in pbw_map[pbw_name]:
-                pbl_stem = sanitize(Path(pbl).stem)
-                if pbl_stem not in seen_req:
-                    seen_req.add(pbl_stem)
-                    required_pbls.append(pbl_stem)
-
-        # Build cache per PBL (incremental)
-        for pbl_stem in sorted(required_pbls, key=lambda s: s.lower()):
-            pbl_sources_dir = version_sources / pbl_stem
-            if not pbl_sources_dir.exists():
-                warnings.append(f"[AICodebase][WARN] {version}: PBL not found in Sources: {pbl_stem}")
-                # If sources missing, keep cache cleanup already handled by mirror presence;
-                # do not rebuild.
-                continue
-
-            fp = compute_pbl_fingerprint(pbl_sources_dir)
-            old = manifest["pbls"].get(pbl_stem, {})
-            old_fp = old.get("fingerprint")
-
-            cache_pbl_dir = cache_dir / pbl_stem
-
-            if old_fp == fp["fingerprint"] and cache_pbl_dir.exists():
-                # No changes → keep as-is
-                continue
-
-            # Rebuild cache for this PBL (deterministic)
-            build_cache_for_pbl(version, pbl_stem, pbl_sources_dir, cache_pbl_dir)
-            manifest["pbls"][pbl_stem] = fp
-
-        # Assemble PBWs (junction to cache, fallback to copy)
-        for pbw_name in sorted(pbw_map.keys(), key=lambda s: s.lower()):
-            out_pbw_dir = version_out / pbw_name
-            out_pbw_dir.mkdir(parents=True, exist_ok=True)
-
-            # Persist PBW mapping in manifest (diagnostic)
-            manifest["pbws"][pbw_name] = [sanitize(Path(p).stem) for p in pbw_map[pbw_name]]
-
-            for pbl in pbw_map[pbw_name]:
-                pbl_stem = sanitize(Path(pbl).stem)
-                cache_pbl_dir = cache_dir / pbl_stem
-                if not cache_pbl_dir.exists():
-                    # If cache missing (e.g., missing Sources), skip assembling
-                    continue
-
-                dest = out_pbw_dir / pbl_stem
-
-                # If dest already exists and is a junction/symlink, we keep it.
-                # But Python cannot reliably detect junction targets without extra APIs,
-                # so we take a safe approach: if it exists and is non-empty dir, keep it only if incremental wanted.
-                # Here we want deterministic, so we recreate if it's not a link.
-                if dest.exists() and not dest.is_symlink():
-                    # If it's a real directory, it's either old copy or stale -> remove and rebuild link/copy
-                    ensure_removed(dest)
-
-                # Try junction first
-                created = try_create_junction(dest, cache_pbl_dir)
-                if not created:
-                    # Fallback: copy from cache (still faster than regenerating)
-                    copy_tree_incremental(cache_pbl_dir, dest)
-
-        # Save manifest and mark as Hidden
-        save_json(manifest_path, manifest)
-        set_hidden_windows(manifest_path)
+    for version in versions_to_process:
+        rc = process_version(
+            version=version,
+            mirror_root=mirror_root,
+            sources_root=sources_root,
+            output_root=output_root,
+            warnings=warnings,
+            project_filter=project_filter,
+        )
+        if rc != 0:
+            return rc
 
     if WARNINGS_ENABLED and warnings:
         print("\n[AICodebase] Warnings summary:")
@@ -654,7 +844,6 @@ def main(argv: List[str]) -> int:
             print(w)
 
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
